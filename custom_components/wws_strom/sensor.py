@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import json
 import logging
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -15,6 +16,7 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
@@ -26,6 +28,7 @@ from .const import (
     AUTH_ENDPOINT,
     CONF_PASSWORD,
     CONF_USERNAME,
+    DOMAIN,
     MEASUREMENTS_ENDPOINT,
     PRICES_ENDPOINT,
 )
@@ -106,7 +109,7 @@ class WWSDataUpdateCoordinator(DataUpdateCoordinator):
             "end": end_now,
             "aggregation_timezone": "Europe/Berlin",
         })
-        
+
         measurements_url = f"{MEASUREMENTS_ENDPOINT}?{measure_params}"
         req_measure = urllib.request.Request(measurements_url, headers=headers, method="GET")
 
@@ -144,6 +147,15 @@ class WWSDataUpdateCoordinator(DataUpdateCoordinator):
         return await self.hass.async_add_executor_job(_update)
 
 
+def _extract_list(raw_data) -> list:
+    """Hilfsfunktion: Extrahiert Listen unabhängig davon, ob die API ein List oder Dict zurückgibt."""
+    if isinstance(raw_data, list):
+        return raw_data
+    if isinstance(raw_data, dict):
+        return raw_data.get("data", raw_data.get("prices", []))
+    return []
+
+
 class WWSPriceSensor(CoordinatorEntity, SensorEntity):
     """Haupt-Sensor für den aktuellen Strompreis und Smart-Tarif Zustand."""
 
@@ -153,7 +165,16 @@ class WWSPriceSensor(CoordinatorEntity, SensorEntity):
     def __init__(self, coordinator: WWSDataUpdateCoordinator):
         super().__init__(coordinator)
         self._attr_name = "WWS Aktueller Strompreis"
-        self._attr_unique_id = "wws_current_electricity_price"
+        self._attr_unique_id = f"wws_current_electricity_price_{coordinator.username}"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.coordinator.username)},
+            name="WestfalenWIND Strom",
+            manufacturer="WestfalenWIND",
+            model="WWS Hochstift Smart",
+        )
 
     @property
     def native_value(self) -> float | None:
@@ -168,7 +189,7 @@ class WWSPriceSensor(CoordinatorEntity, SensorEntity):
         """Liefert is_smart, Tarifname und die Preisprognose."""
         current_entry = self._get_current_entry()
         prices_data = self.coordinator.data.get("prices", {}) if self.coordinator.data else {}
-        raw_list = prices_data.get("data", [])
+        raw_list = _extract_list(prices_data)
 
         is_smart = False
         tariff_name = "Unbekannt"
@@ -189,54 +210,67 @@ class WWSPriceSensor(CoordinatorEntity, SensorEntity):
     def _get_current_entry(self) -> dict | None:
         """Ermittelt den aktuellen Stundeneintrag aus den Preisdaten."""
         prices_data = self.coordinator.data.get("prices", {}) if self.coordinator.data else {}
-        data_list = prices_data.get("data", [])
+        data_list = _extract_list(prices_data)
         if not data_list:
             return None
 
         now = datetime.now(timezone.utc)
 
         for entry in data_list:
+            if not isinstance(entry, dict):
+                continue
             try:
                 start_dt = datetime.fromisoformat(entry["start"].replace("Z", "+00:00"))
                 end_dt = datetime.fromisoformat(entry["end"].replace("Z", "+00:00"))
 
                 if start_dt <= now < end_dt:
                     return entry
-            except (ValueError, KeyError):
+            except (ValueError, KeyError, AttributeError):
                 continue
 
-        return data_list[0] if data_list else None
+        return data_list[0] if data_list and isinstance(data_list[0], dict) else None
 
 
 class WWSMeasurementSensor(CoordinatorEntity, SensorEntity):
     """Sensor für den heutigen Energieverbrauch (aus der Smart-Meter-Messung)."""
 
-    _attr_name = "WWS Energieverbrauch Heute"
-    _attr_unique_id = "wws_energy_consumption_today"
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
     _attr_native_unit_of_measurement = "kWh"
+
+    def __init__(self, coordinator: WWSDataUpdateCoordinator):
+        super().__init__(coordinator)
+        self._attr_name = "WWS Energieverbrauch Heute"
+        self._attr_unique_id = f"wws_energy_consumption_today_{coordinator.username}"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.coordinator.username)},
+            name="WestfalenWIND Strom",
+            manufacturer="WestfalenWIND",
+            model="WWS Hochstift Smart",
+        )
 
     @property
     def native_value(self) -> float | None:
         """Summiert den Verbrauch des heutigen Tages."""
         m_data = self.coordinator.data.get("measurements", {}) if self.coordinator.data else {}
-        data_list = m_data.get("data", [])
-        
+        data_list = _extract_list(m_data)
+
         if not data_list:
             return None
 
-        # Verbrauchsmenge in kWh zurückgeben
-        total_kwh = sum(float(item.get("energy_kwh", 0)) for item in data_list)
+        total_kwh = sum(float(item.get("energy_kwh", 0)) for item in data_list if isinstance(item, dict))
         return round(total_kwh, 3)
 
     @property
     def extra_state_attributes(self) -> dict:
         """Gibt auch die angefallenen Gesamtkosten in EUR aus."""
         m_data = self.coordinator.data.get("measurements", {}) if self.coordinator.data else {}
-        data_list = m_data.get("data", [])
+        data_list = _extract_list(m_data)
 
-        total_cost_eur = sum(float(item.get("cost_eur", 0)) for item in data_list)
+        total_cost_eur = sum(float(item.get("cost_eur", 0)) for item in data_list if isinstance(item, dict))
 
         return {
             "cost_today_eur": round(total_cost_eur, 2),
