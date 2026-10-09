@@ -1,0 +1,11 @@
+{
+  "domain": "wws_strom",
+  "name": "WestfalenWIND Strom (WWS)",
+  "codeowners": ["@Chewi86"],
+  "config_flow": true,
+  "documentation": "https://github.com/Chewi86/ha-wws-strom",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/Chewi86/ha-wws-strom/issues",
+  "requirements": [],
+  "version": "1.0.0"
+}
