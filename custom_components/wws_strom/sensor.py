@@ -87,26 +87,42 @@ class WWSDataUpdateCoordinator(DataUpdateCoordinator):
             return res_data.get("access_token") or res_data.get("token")
 
     def _fetch_data(self, token: str) -> dict:
-        """Holt sowohl die /latest Preissignale als auch die heutigen Messwerte."""
+        """Holt die Preissignale (heute + morgen) sowie die heutigen Messwerte."""
         headers = {
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
         }
 
-        # 1. Neueste Preise abrufen
-        req_prices = urllib.request.Request(PRICES_ENDPOINT, headers=headers, method="GET")
-        with urllib.request.urlopen(req_prices, timeout=10) as response:
-            prices_data = json.loads(response.read().decode("utf-8"))
-
-        # 2. Heutige Messwerte abfragen (Start heute 00:00 bis jetzt)
+        # Zeitfenster: Heute 00:00 Uhr bis morgen 23:59 Uhr
         now = datetime.now(timezone.utc)
         start_today = now.replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
-        end_now = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_tomorrow = (now + timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+        # 1. Preise mit explizitem Datumsbereich abrufen
+        # Falls PRICES_ENDPOINT auf /latest steht, wird der Basis-Endpunkt /public/energyprices/ verwendet
+        base_prices_endpoint = PRICES_ENDPOINT.replace("/latest", "")
+        price_params = urllib.parse.urlencode({
+            "start": start_today,
+            "end": end_tomorrow,
+            "aggregation_timezone": "Europe/Berlin",
+        })
+        prices_url = f"{base_prices_endpoint}?{price_params}"
+
+        try:
+            req_prices = urllib.request.Request(prices_url, headers=headers, method="GET")
+            with urllib.request.urlopen(req_prices, timeout=10) as response:
+                prices_data = json.loads(response.read().decode("utf-8"))
+        except Exception as err:
+            _LOGGER.warning("Fehler beim Abruf mit Datumsfilter, nutze /latest Fallback: %s", err)
+            req_prices = urllib.request.Request(PRICES_ENDPOINT, headers=headers, method="GET")
+            with urllib.request.urlopen(req_prices, timeout=10) as response:
+                prices_data = json.loads(response.read().decode("utf-8"))
+
+        # 2. Heutige Messwerte abfragen
         measure_params = urllib.parse.urlencode({
             "resolution": "DAY",
             "start": start_today,
-            "end": end_now,
+            "end": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "aggregation_timezone": "Europe/Berlin",
         })
 
@@ -214,21 +230,22 @@ class WWSPriceSensor(CoordinatorEntity, SensorEntity):
         if not data_list:
             return None
 
-        now = datetime.now(timezone.utc)
+        now = dt_util.now()
 
         for entry in data_list:
             if not isinstance(entry, dict):
                 continue
             try:
-                start_dt = datetime.fromisoformat(entry["start"].replace("Z", "+00:00"))
-                end_dt = datetime.fromisoformat(entry["end"].replace("Z", "+00:00"))
+                start_dt = dt_util.parse_datetime(entry["start"])
+                end_dt = dt_util.parse_datetime(entry["end"])
 
-                if start_dt <= now < end_dt:
+                if start_dt and end_dt and start_dt <= now < end_dt:
                     return entry
-            except (ValueError, KeyError, AttributeError):
+            except (ValueError, KeyError, TypeError):
                 continue
 
-        return data_list[0] if data_list and isinstance(data_list[0], dict) else None
+        # WICHTIG: Wenn die aktuelle Stunde nicht enthalten ist, None zurückgeben (kein data_list[0]!)
+        return None
 
 
 class WWSMeasurementSensor(CoordinatorEntity, SensorEntity):
