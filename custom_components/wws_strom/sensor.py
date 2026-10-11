@@ -385,29 +385,44 @@ class WWSDataUpdateCoordinator(DataUpdateCoordinator):
             return res_data.get("access_token") or res_data.get("token")
 
     def _fetch_data(self, token: str) -> dict:
-        """Holt Preissignale sowie heutige Messwerte."""
+        """Holt historische Preissignale sowie historische Messwerte für einen flexiblen Zeitraum."""
         headers = {
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
         }
 
-        # 1. Neueste Preise abrufen
+        now = datetime.now(timezone.utc)
+        
+        # 1. Zeitfenster für Preise (z. B. 7 Tage zurück bis morgen)
+        start_prices = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_prices = (now + timedelta(days=1)).replace(hour=23, minute=59, second=59, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # 2. Zeitfenster für Messwerte: Rückwirkend für die letzten 30 Tage bis jetzt
+        start_measurements = (now - timedelta(days=30)).replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_now = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Preise abrufen (über HISTORIC_PRICES_ENDPOINT mit start/end)
+        price_params = urllib.parse.urlencode({
+            "start": start_prices,
+            "end": end_prices,
+            "aggregation_timezone": "Europe/Berlin",
+        })
+        prices_url = f"{HISTORIC_PRICES_ENDPOINT}?{price_params}"
+
         try:
-            req_prices = urllib.request.Request(PRICES_ENDPOINT, headers=headers, method="GET")
+            req_prices = urllib.request.Request(prices_url, headers=headers, method="GET")
             with urllib.request.urlopen(req_prices, timeout=10) as response:
                 prices_data = json.loads(response.read().decode("utf-8"))
         except Exception as err:
-            _LOGGER.warning("Fehler beim Abruf der Strompreise: %s", err)
-            prices_data = []
+            _LOGGER.warning("Fehler beim Abruf der historischen Preise, nutze /latest Fallback: %s", err)
+            req_prices = urllib.request.Request(PRICES_ENDPOINT, headers=headers, method="GET")
+            with urllib.request.urlopen(req_prices, timeout=10) as response:
+                prices_data = json.loads(response.read().decode("utf-8"))
 
-        # 2. Heutige Messwerte abfragen (Start heute 00:00 bis jetzt)
-        now = datetime.now(timezone.utc)
-        start_today = now.replace(hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
-        end_now = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-
+        # Historische Messwerte abrufen
         measure_params = urllib.parse.urlencode({
             "resolution": "DAY",
-            "start": start_today,
+            "start": start_measurements,
             "end": end_now,
             "aggregation_timezone": "Europe/Berlin",
         })
@@ -420,7 +435,7 @@ class WWSDataUpdateCoordinator(DataUpdateCoordinator):
             with urllib.request.urlopen(req_measure, timeout=10) as response:
                 measurements_data = json.loads(response.read().decode("utf-8"))
         except Exception as err:
-            _LOGGER.warning("Messwerte konnten nicht geladen werden: %s", err)
+            _LOGGER.warning("Historische Messwerte konnten nicht geladen werden: %s", err)
 
         return {
             "prices": prices_data,
@@ -534,7 +549,7 @@ class WWSPriceSensor(CoordinatorEntity, SensorEntity):
 
 
 class WWSMeasurementSensor(CoordinatorEntity, SensorEntity):
-    """Sensor für den heutigen Energieverbrauch (Smart Meter)."""
+    """Sensor für den Energieverbrauch (inkl. historischer Smart-Meter-Daten)."""
 
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
@@ -556,25 +571,36 @@ class WWSMeasurementSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def native_value(self) -> float | None:
-        """Summiert den Verbrauch des heutigen Tages in kWh."""
+        """Filtert den Verbrauch des heutigen Tages aus den historischen Messdaten."""
         m_data = self.coordinator.data.get("measurements", {}) if self.coordinator.data else {}
         data_list = _extract_list(m_data)
 
         if not data_list:
             return None
 
-        total_kwh = sum(float(item.get("energy_kwh", 0)) for item in data_list if isinstance(item, dict))
-        return round(total_kwh, 3)
+        today_str = dt_util.now().strftime("%Y-%m-%d")
+
+        for item in data_list:
+            if not isinstance(item, dict):
+                continue
+            start_val = item.get("start", "")
+            if today_str in start_val:
+                return round(float(item.get("energy_kwh", 0)), 3)
+
+        # Fallback auf den neuesten Eintrag
+        if data_list:
+            latest = data_list[-1]
+            if isinstance(latest, dict):
+                return round(float(latest.get("energy_kwh", 0)), 3)
+
+        return 0.0
 
     @property
     def extra_state_attributes(self) -> dict:
-        """Gibt die angefallenen Gesamtkosten in EUR sowie Rohdaten aus."""
+        """Gibt die vollständige Verbrauchshistorie (z. B. letzte 30 Tage) als Attribut aus."""
         m_data = self.coordinator.data.get("measurements", {}) if self.coordinator.data else {}
         data_list = _extract_list(m_data)
 
-        total_cost_eur = sum(float(item.get("cost_eur", 0)) for item in data_list if isinstance(item, dict))
-
         return {
-            "cost_today_eur": round(total_cost_eur, 2),
-            "raw_measurements": data_list,
+            "history": data_list,
         }

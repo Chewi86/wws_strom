@@ -152,7 +152,7 @@ class WWSConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            schema=STEP_USER_DATA_SCHEMA,
+            data_schema=STEP_USER_DATA_SCHEMA,
             errors=errors,
         )
 
